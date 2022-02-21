@@ -1,14 +1,13 @@
 import asyncio
 from collections import defaultdict
-from typing import Any, Callable, Dict
-
+from typing import Any, Callable, Dict, List
 from xml.etree import ElementTree as ET
 
-from networkmapper.utils import async_for
 from networkmapper.exceptions import NmapError
+from networkmapper.logman import logger
+from networkmapper.settings import nmap_path
+from networkmapper.utils import async_for
 
-nmap_path = ""  # TODO (Shubham) Make this configurable
-cmnd_args = "-oX - -Pn --script ssl-cert".split(" ")
 _stdout: Callable[[], Dict[str, Dict]] = lambda: {
     "state": dict(),
     "service": dict(),
@@ -42,7 +41,7 @@ async def cleandict(badd: Dict[str, Any]) -> Dict[str, Any]:
     return cleaned
 
 
-class _SSLCertXMLTarget:
+class _ScriptXMLTarget:
     ports: Dict[str, Dict] = defaultdict(_stdout)
     lpkey: str = ""
 
@@ -70,10 +69,18 @@ class _SSLCertXMLTarget:
 
 
 class Nmap:
-    def __init__(self, ip: str) -> None:
-        self.__parser = ET.XMLParser(target=_SSLCertXMLTarget())
+    default_args = "-oX - -Pn".split(" ")
+
+    def __init__(self, ip: str, *args, **kwargs) -> None:
+        self.__parser = ET.XMLParser(target=_ScriptXMLTarget())
         self.__raw: Dict[str, Any] = dict()
+        self._cmnd_args: List[str] = list(Nmap.default_args)
         self._ip = ip
+
+        self._cmnd_args.extend(list(args))
+
+        for key, val in kwargs.items():
+            self._cmnd_args.extend([key, val])
 
     @property
     def raw(self):
@@ -142,9 +149,10 @@ class Nmap:
         Returns:
             Dict[str, Any]: `ssl-cert` script data
         """
+        logger.info(f"Parsing script attribute for IP: '{self._ip}'")
 
         if output := attrib.get("output"):
-            return await self.outputdict(output)
+            return await Nmap.outputdict(output)
         return dict()
 
     async def parse(self, output: bytes) -> None:
@@ -153,27 +161,33 @@ class Nmap:
         Args:
             output (bytes): nmap std output
         """
+        logger.info(f"Parsing output of IP: '{self._ip}'")
+
         try:
             self.__parser.feed(output)
         except Exception as xerr:
-            pass  # TODO (Shubham): Complete this
+            logger.error(f"errored in feeding output of IP: '{self._ip}'\n\tError: {str(xerr)}", exc_info=True)
+            self.__raw = {"error": "unable to parse namp output"}
+            return
 
         self.__raw = self.__parser.close()
 
-        async for _, data in async_for(self.__raw.items()):
-            self.__raw.update({"scriptDict": await self.parse_attrib(data.get("script", dict()))})
+        async for port, data in async_for(self.__raw.items()):
+            logger.info(f"Processing PORT: {port}, for IP {self._ip}")
+            data.update({"scriptDict": await self.parse_attrib(data.get("script", dict()))})
 
-    async def nmap(self, timeout: int = 120) -> None:
+    async def scan(self, timeout: int = 120) -> None:
         """Spawn nmap subprocess and parse output
 
         Args:
             timeout (int, optional): timeout for suprocess. Default to 120.
         """
+        logger.info(f"initiating for IP: '{self._ip}' args: {self._cmnd_args}")
 
-        cmnd = cmnd_args + [f"{self._ip}"]
+        cmnd = self._cmnd_args + [f"{self._ip}"]
         subp = await asyncio.create_subprocess_exec(
             nmap_path, *cmnd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
-        )  # TODO (Shubham): Don't do DEVNULL .. return error back
+        )
 
         try:
             stdout, stderr = await asyncio.wait_for(subp.communicate(), timeout=timeout)
@@ -182,6 +196,8 @@ class Nmap:
             else:
                 raise NmapError(stderr)
         except asyncio.TimeoutError:
+            logger.warn(f"timedout for IP: '{self._ip}'")
             subp.kill()
         except NmapError as nerr:
-            pass  # TODO (Shubham): Complete this
+            logger.error(f"errored for IP: '{self._ip}'\n\tError: {str(nerr)}", exc_info=True)
+            self.__raw = {"error": "error from nmap subprocess"}
